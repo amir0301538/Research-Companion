@@ -1,0 +1,25 @@
+# Persistent browser profiles and sessions
+.chrome_profile/
+.edge_profile/
+
+# Scraper outputs and logs
+output/
+*.log
+
+# Python cache and byte-compiled files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Environment files and credentials
+.env
+.env.*
+
+# Temporary test outputs
+tests/_tmp_output/
+tests/_tmp_*/

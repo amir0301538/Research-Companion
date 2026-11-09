@@ -10,6 +10,7 @@ output/
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
 
 # Virtual environments
 .venv/
@@ -23,3 +24,6 @@ env/
 # Temporary test outputs
 tests/_tmp_output/
 tests/_tmp_*/
+
+# Unrelated local CAPTCHA training data (never part of the scraper repository)
+Recaptcha Dataset/

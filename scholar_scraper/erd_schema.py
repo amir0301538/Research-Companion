@@ -89,15 +89,60 @@ ERD_ENTITIES = OrderedDict(
 )
 
 # Entity -> CSV file written to the output folder.
-# HEIs is intentionally NOT exported: the profile front page shows only a
-# free-text affiliation line, which cannot reliably populate any HEIs column.
-# Its attributes are still assessed in extraction_report.txt.
+# All six database entities in scope for the Google Scholar profile scraper
+# are exported with exact DOCX column names and order.
 CSV_FILES = OrderedDict(
     [
+        ("HEIs", "heis.csv"),
         ("SCHOLARS", "scholars.csv"),
-        ("RESEARCH_AREAS", "research_areas.csv"),
         ("PUBLICATIONS", "publications.csv"),
+        ("RESEARCH_AREAS", "research_areas.csv"),
         ("Scholar Research Areas", "scholar_research_areas.csv"),
         ("Authors Publications", "authors_publications.csv"),
+    ]
+)
+
+# Extended / proposed Stage-2 publication detail entities written to
+# output/supplementary/ while keeping the 6 core DOCX-verified CSVs intact.
+DETAIL_ENTITIES = OrderedDict(
+    [
+        (
+            "PUBLICATION_DETAILS",
+            [
+                "publication_id",
+                "scholar_id",
+                "title",
+                "authors_text",
+                "publication_date",
+                "publication_year",
+                "journal",
+                "volume",
+                "issue",
+                "pages",
+                "publisher",
+                "description",
+                "citation_count",
+                "publication_url",
+                "publisher_url",
+                "doi",
+                "last_synced_at",
+            ],
+        ),
+        (
+            "PUBLICATION_YEARLY_CITATIONS",
+            [
+                "publication_id",
+                "citation_year",
+                "citation_count",
+                "last_synced_at",
+            ],
+        ),
+    ]
+)
+
+DETAIL_CSV_FILES = OrderedDict(
+    [
+        ("PUBLICATION_DETAILS", "publication_details.csv"),
+        ("PUBLICATION_YEARLY_CITATIONS", "publication_yearly_citations.csv"),
     ]
 )

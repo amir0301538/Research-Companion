@@ -1,5 +1,11 @@
 # PROJECT_HANDOVER_REPORT
 
+> **Historical snapshot:** This report records the project state audited on
+> 2026-11-01. It predates the desktop GUI, persistent ID registry, Step 2 detail
+> scraping, smart resume, safe scholar deletion, taxonomy-independent research
+> areas, and the current test suite. Use `README.md` and the current source/tests
+> for present behavior; retain this file only as project history.
+
 Date of audit: 2026-11-01 (local, UTC+5). Workspace: `c:\Users\Muhammad Aamir\Desktop\FYP\Project`
 
 > **HEADLINE:** The scraper code is fully written and its offline logic is tested, but **the live scrape has NEVER succeeded.** Google Scholar answered HTTP 429 and redirected to `google.com/sorry/` (CAPTCHA/rate-limit) on every attempt: the earlier session (2026-10-31 21:26) and again in this session (2026-11-01 07:45). Per the rules, nothing was bypassed and **no real CSVs exist**. All "live-DOM" extraction code (selectors, SHOW MORE loop) is therefore **unverified against the live page**.

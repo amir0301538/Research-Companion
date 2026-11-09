@@ -14,6 +14,7 @@ from scholar_scraper.browser import (
     AccessBlockedError,
     DiagnosticNetworkStats,
     ProfileData,
+    JS_PAGE_STATE,
     _check_blocked,
     _scrape,
     _verify_profile_owner,
@@ -126,7 +127,7 @@ def test_normal_mode_stops_immediately_on_429():
     print("PASS 2. test_normal_mode_stops_immediately_on_429")
 
 
-def test_manual_mode_reaches_await_manual_access_on_429():
+def test_manual_mode_stops_on_429_without_interactive_challenge():
     mock_page = MagicMock()
     mock_page.url = "https://scholar.google.com/citations?hl=en&user=vdh-mOQAAAAJ"
     mock_browser = MagicMock()
@@ -140,18 +141,11 @@ def test_manual_mode_reaches_await_manual_access_on_429():
 
     data = ProfileData(requested_url="https://scholar.google.com/citations?hl=en&user=vdh-mOQAAAAJ")
 
-    await_called = []
-
-    def fake_await(page, d, reason, wait_s):
-        await_called.append((reason, wait_s))
-        # Simulate user resolving to profile
-        mock_page.url = "https://scholar.google.com/citations?hl=en&user=vdh-mOQAAAAJ"
-
     def fake_evaluate(js, *args):
-        if "captcha" in js:
+        if js == JS_PAGE_STATE:
+            return "unusual_traffic"
+        if "captcha:" in js:
             return {"captcha": False, "unusual": False, "profile": True}
-        if "JS_PAGE_STATE" in js:
-            return "profile"
         if "scholar_name" in js:
             return {
                 "scholar_name": "Test Scholar", "affiliation_text": None,
@@ -164,15 +158,17 @@ def test_manual_mode_reaches_await_manual_access_on_429():
     mock_page.locator.return_value.count.return_value = 0
 
     with patch("scholar_scraper.browser._launch", return_value=mock_browser), \
-         patch("scholar_scraper.browser._await_manual_access", side_effect=fake_await), \
+         patch("scholar_scraper.browser._await_manual_access") as wait_mock, \
          patch("scholar_scraper.browser.sync_playwright"):
-        _scrape(data, data.requested_url, headless=False, delay=1.0, timeout_s=5.0,
-                max_show_more=10, channel="auto", manual=True, manual_wait_s=120.0)
+        try:
+            _scrape(data, data.requested_url, headless=False, delay=1.0, timeout_s=5.0,
+                    max_show_more=10, channel="auto", manual=True, manual_wait_s=120.0)
+            raise AssertionError("Expected HTTP 429 without a CAPTCHA to stop")
+        except AccessBlockedError as exc:
+            assert exc.block_kind == "http_429_no_challenge"
 
-    assert len(await_called) == 1
-    assert "429" in await_called[0][0]
-    assert await_called[0][1] == 120.0
-    print("PASS 1. test_manual_mode_reaches_await_manual_access_on_429")
+    wait_mock.assert_not_called()
+    print("PASS 1. test_manual_mode_stops_on_429_without_interactive_challenge")
 
 
 def test_xhr_429_during_show_more_stops_extraction():
@@ -353,7 +349,7 @@ if __name__ == "__main__":
     test_url_redaction()
     test_diagnostic_stats_collection_and_redaction()
     test_normal_mode_stops_immediately_on_429()
-    test_manual_mode_reaches_await_manual_access_on_429()
+    test_manual_mode_stops_on_429_without_interactive_challenge()
     test_xhr_429_during_show_more_stops_extraction()
     test_manual_navigation_updates_final_http_status()
     test_failure_report_diagnostic_rendering()

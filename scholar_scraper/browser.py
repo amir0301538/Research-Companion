@@ -1,11 +1,11 @@
 """
-Playwright-based extraction from a Google Scholar profile FRONT PAGE.
+Playwright profile extraction and profile-click-based publication detail scraping.
 
 Scope rules enforced here:
-  * Only the given profile URL is opened (one page.goto call).
+  * Stage 1 opens only the supplied profile URL.
   * "SHOW MORE" is clicked to load the rest of the publication table. This is an
     in-page AJAX request; the browser never navigates away from the profile.
-  * Publication links are READ from the DOM, never opened.
+  * Stage 1 only reads publication links. Stage 2 clicks matching profile links.
   * CAPTCHA / "unusual traffic" pages are detected and reported, never bypassed.
 """
 
@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit
+from urllib.parse import parse_qs, parse_qsl, urlencode, urlparse, urlsplit, urlunsplit, urljoin
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -1535,6 +1535,131 @@ def parse_detail_dom_payload(raw_dom: dict, detail_url: str, timestamp: str = ""
     }
 
 
+class UnresolvedPublicationError(ScraperError):
+    """The requested citation cannot be identified without guessing."""
+
+
+def citation_identifier(url: str) -> str:
+    """Decode the opaque, case-sensitive citation key; never match by title/index."""
+    return parse_qs(urlparse(url).query).get("citation_for_view", [""])[0].strip()
+
+
+class ProfileDetailNavigator:
+    """Open details through the profile UI, retaining its expanded listing."""
+
+    def __init__(self, page, profile_url, stats=None, timeout_ms=45000,
+                 interaction_delay=0.5, post_click_delay=1.0, return_delay=1.0,
+                 emit=None, manual=False, manual_wait_s=600, manual_callback=None, cancel_event=None):
+        parse_google_scholar_id(profile_url)
+        self.page, self.profile_url, self.stats = page, profile_url, stats
+        self.timeout_ms = timeout_ms
+        self.interaction_delay = max(0.5, interaction_delay)
+        self.post_click_delay = max(1.0, post_click_delay)
+        self.return_delay = max(1.0, return_delay)
+        self.emit = emit or (lambda message: None)
+        self.ready = False
+        self.detail_page = page
+        self.manual, self.manual_wait_s = manual, manual_wait_s
+        self.manual_callback, self.cancel_event = manual_callback, cancel_event
+
+    def prepare(self):
+        if self.ready:
+            return
+        self.emit("Opening scholar profile")
+        time.sleep(self.interaction_delay)
+        response = self.page.goto(self.profile_url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+        try:
+            _check_blocked(self.page, status=response.status if response else None, stats=self.stats)
+        except AccessBlockedError as blocked:
+            if not self.manual or self.page.evaluate(JS_PAGE_STATE) != "captcha":
+                raise
+            _await_manual_access(self.page, ProfileData(requested_url=self.profile_url), str(blocked),
+                                 self.manual_wait_s, expected_state="profile",
+                                 progress_callback=self.manual_callback, cancel_event=self.cancel_event,
+                                 stats=self.stats)
+        self.page.wait_for_selector("#gsc_prf_in", timeout=self.timeout_ms)
+        self.page.wait_for_selector("#gsc_a_b", state="attached", timeout=self.timeout_ms)
+        data = ProfileData(requested_url=self.profile_url, google_scholar_id=parse_google_scholar_id(self.profile_url))
+        _verify_profile_owner(self.page, data, self.stats)
+        self.emit("Loading publications / Expanding SHOW MORE")
+        _expand_publications(self.page, data, self.stats, delay=self.interaction_delay,
+                             timeout_ms=self.timeout_ms)
+        self.ready = True
+
+    def open(self, detail_url):
+        self.prepare()
+        _check_blocked(self.page, stats=self.stats)
+        self.emit("Matching publication by citation identifier")
+        key = citation_identifier(detail_url)
+        links = self.page.locator("#gsc_a_b a.gsc_a_at")
+        matches = []
+        for i in range(links.count()):
+            link = links.nth(i)
+            href = urljoin(self.profile_url, link.get_attribute("href") or "")
+            if key and is_valid_detail_url(href) and citation_identifier(href) == key:
+                matches.append(link)
+        if len(matches) != 1:
+            raise UnresolvedPublicationError(f"UNRESOLVED: expected exactly one profile link for citation {key!r}; found {len(matches)}")
+        popup = []
+        def on_popup(page):
+            popup.append(page)
+            if self.stats:
+                setup_diagnostic_listeners(page, self.stats, log)
+        self.page.on("popup", on_popup)
+        try:
+            time.sleep(self.interaction_delay)
+            self.emit("Clicking publication title")
+            matches[0].click(timeout=self.timeout_ms)
+            self.emit("Waiting for detail content")
+            self.page.wait_for_timeout(self.post_click_delay * 1000)
+            self.detail_page = popup[0] if popup else self.page
+            self.detail_page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
+            _check_blocked(self.detail_page, stats=self.stats)
+            self.detail_page.wait_for_selector("#gsc_oci_title, #gsc_vcd_title", timeout=self.timeout_ms)
+            self.verify(detail_url)
+            return self.detail_page
+        except PlaywrightTimeout:
+            _check_blocked(self.detail_page, stats=self.stats)
+            raise
+        finally:
+            self.page.remove_listener("popup", on_popup)
+
+    def verify(self, detail_url):
+        expected = citation_identifier(detail_url)
+        # Dialogs can leave the address bar on the profile. Their form records the
+        # citation key; a different address-bar key must never be accepted.
+        actual = citation_identifier(self.detail_page.url)
+        if not actual:
+            actual = self.detail_page.locator(
+                "#gsc_oci input[name='citation_for_view'], #gsc_vcd input[name='citation_for_view']"
+            ).evaluate_all("els => els.length === 1 ? els[0].value : ''")
+        if actual != expected:
+            raise UnresolvedPublicationError("UNRESOLVED: opened detail citation identity could not be verified")
+
+    def return_to_profile(self):
+        self.emit("Returning to profile")
+        _check_blocked(self.detail_page, stats=self.stats)
+        time.sleep(self.interaction_delay)
+        if self.detail_page is not self.page:
+            self.detail_page.close()
+        else:
+            close = self.page.locator("#gs_md_cita-d-x, #gsc_oci_close, #gsc_vcd_close")
+            visible = [close.nth(i) for i in range(close.count()) if close.nth(i).is_visible()]
+            if visible:
+                visible[0].click(timeout=self.timeout_ms)
+                self.page.locator("#gsc_oci_title, #gsc_vcd_title").wait_for(state="hidden", timeout=self.timeout_ms)
+            else:
+                self.page.go_back(wait_until="domcontentloaded", timeout=self.timeout_ms)
+        _check_blocked(self.page, stats=self.stats)
+        self.page.wait_for_selector("#gsc_prf_in", timeout=self.timeout_ms)
+        self.page.wait_for_selector("#gsc_a_b", state="attached", timeout=self.timeout_ms)
+        time.sleep(self.return_delay)
+        # A document navigation may have discarded expanded rows. Expanding an
+        # already complete retained listing performs no additional requests.
+        _expand_publications(self.page, ProfileData(requested_url=self.profile_url), self.stats,
+                             delay=self.interaction_delay, timeout_ms=self.timeout_ms)
+
+
 def scrape_publication_detail_on_page(
     page,
     detail_url: str,
@@ -1546,9 +1671,11 @@ def scrape_publication_detail_on_page(
     proxy_url: Optional[str] = None,
     manual_status_callback=None,
     manual_cancel_event=None,
+    navigate: bool = True,
 ) -> dict:
     """
-    Navigate `page` to a single validated Google Scholar publication detail URL
+    Standalone compatibility helper: optionally navigate to a validated detail URL.
+    Normal Step 2 passes navigate=False after a verified profile-link click.
     (`view_op=view_citation`), verify no HTTP 429 or CAPTCHA block occurred,
     and extract the complete detail DOM metadata without clicking any outbound
     links ('Cited by', 'Related articles', author links, or publisher links).
@@ -1558,12 +1685,12 @@ def scrape_publication_detail_on_page(
             f"Refusing to open non-detail URL in Stage 2 detail scraper: {redact_url(detail_url)}"
         )
 
-    if stats:
+    if stats and navigate:
         stats.has_429 = False
         stats.sorry_redirect = False
 
     try:
-        resp = page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms)
+        resp = page.goto(detail_url, wait_until="domcontentloaded", timeout=timeout_ms) if navigate else None
     except PlaywrightTimeout as e:
         _check_blocked(page, stats=stats)
         raise classify_navigation_error(
@@ -1635,7 +1762,7 @@ def scrape_publication_detail_on_page(
 
     _check_blocked(page, status=status, stats=stats)
     raw_dom = page.evaluate(JS_PUBLICATION_DETAIL)
-    parsed = parse_detail_dom_payload(raw_dom, detail_url=page.url or detail_url, timestamp=timestamp)
+    parsed = parse_detail_dom_payload(raw_dom, detail_url=canonicalize_detail_url(detail_url), timestamp=timestamp)
     parsed["requested_detail_url"] = detail_url
     parsed["canonical_detail_url"] = canonicalize_detail_url(detail_url)
     parsed["http_status"] = status
@@ -1661,9 +1788,13 @@ def scrape_publications_details_batch(
     progress_callback=None,
     verified_complete_ids: Optional[set[str]] = None,
     manual_cancel_event=None,
+    profile_url: Optional[str] = None,
+    interaction_delay: float = 0.5,
+    post_click_delay: float = 1.0,
+    return_delay: float = 1.0,
 ) -> dict:
     """
-    Stage 2: Sequential publication detail scraping with checkpoint/resume support.
+    Stage 2: Sequential profile-link clicks with checkpoint/resume support.
 
     Parameters:
       publications_queue: list of dicts with keys:
@@ -1680,6 +1811,8 @@ def scrape_publications_details_batch(
     saving checkpoint state atomically after every publication so completed work is preserved.
     """
     timeout_ms = int(timeout_s * 1000)
+    if manual:
+        headless = False
     queue_ids = {str(item.get("publication_id") or "").strip() for item in publications_queue}
     existing_records: dict[str, dict] = {}
     by_canonical_url: dict[str, str] = {}
@@ -1759,6 +1892,7 @@ def scrape_publications_details_batch(
         })
 
     def _run_loop(page, stats: Optional[DiagnosticNetworkStats]):
+        navigator = None
         seen_urls_in_queue: dict[str, str] = dict(by_canonical_url)
         for item in publications_queue:
             pid = str(item.get("publication_id") or "").strip()
@@ -1843,6 +1977,15 @@ def scrape_publications_details_batch(
                 redact_url(raw_url),
             )
             try:
+                if navigator is None:
+                    user = parse_qs(urlparse(raw_url).query).get("user", [""])[0]
+                    target_profile = profile_url or ("https://scholar.google.com/citations?" + urlencode({"user": user, "hl": "en"}))
+                    navigator = ProfileDetailNavigator(page, target_profile, stats, timeout_ms,
+                        interaction_delay, post_click_delay, return_delay, manual=manual,
+                        manual_wait_s=manual_wait_s, manual_callback=progress_callback,
+                        cancel_event=manual_cancel_event)
+                navigator.emit = lambda message: _emit_detail_progress(
+                    "step2_navigation", current_title=pub_title, current_pid=pid, status=message)
                 def _manual_status(ev: dict):
                     if not progress_callback:
                         return
@@ -1858,8 +2001,17 @@ def scrape_publications_details_batch(
                     })
                     progress_callback(payload)
 
+                try:
+                    detail_page = navigator.open(raw_url)
+                except AccessBlockedError:
+                    # The existing extractor owns passive manual verification for
+                    # a detail challenge. Profile restrictions stop immediately.
+                    if not manual or not navigator.ready:
+                        raise
+                    detail_page = navigator.detail_page
+                navigator.emit("Extracting metadata")
                 parsed = scrape_publication_detail_on_page(
-                    page,
+                    detail_page,
                     raw_url,
                     stats=stats,
                     timeout_ms=timeout_ms,
@@ -1869,7 +2021,11 @@ def scrape_publications_details_batch(
                     proxy_url=proxy_url,
                     manual_status_callback=_manual_status,
                     manual_cancel_event=manual_cancel_event,
+                    navigate=False,
                 )
+                navigator.verify(raw_url)
+                if not parsed.get("title"):
+                    raise ScraperError("Detail extraction returned no title")
                 missing_fields = [
                     k
                     for k in (
@@ -1910,8 +2066,21 @@ def scrape_publications_details_batch(
                     (parsed.get("journal") or "")[:40],
                     len(parsed.get("yearly_citations") or []),
                 )
+                navigator.emit("Saving checkpoint")
                 _save_checkpoint()
                 _emit_detail_progress("step2_progress", current_title=parsed.get("title") or pub_title, current_pid=pid, status=f"Scraped detail page (#{pid})")
+                try:
+                    navigator.return_to_profile()
+                except Exception as return_error:
+                    # The successful record is durable even if returning fails.
+                    summary["return_error"] = str(return_error)
+                    if isinstance(return_error, AccessBlockedError):
+                        summary["stopped_by_block"] = True
+                        summary["block_reason"] = str(return_error)
+                    _save_checkpoint()
+                    _emit_detail_progress("step2_blocked" if summary["stopped_by_block"] else "step2_failed",
+                                          pub_title, pid, f"Stopped returning to profile: {return_error}")
+                    break
             except ManualVerificationCancelled as cancelled:
                 err_str = str(cancelled)
                 log.warning("[Stage 2 Detail] MANUAL VERIFICATION CANCELLED on publication_id=%s: %s", pid, err_str)
@@ -1964,7 +2133,7 @@ def scrape_publications_details_batch(
                     "scholar_id": sid,
                     "publication_url": raw_url,
                     "canonical_detail_url": canon_url,
-                    "status": "FAILED",
+                    "status": "UNRESOLVED" if isinstance(exc, UnresolvedPublicationError) else "FAILED",
                     "error": err_str,
                     "extracted_at": now_ts,
                     "metadata": None,
@@ -1973,6 +2142,8 @@ def scrape_publications_details_batch(
                 summary["failed_this_run"] += 1
                 _save_checkpoint()
                 _emit_detail_progress("step2_progress", current_title=pub_title, current_pid=pid, status=f"Failed (#{pid}): {err_str}")
+                if not isinstance(exc, UnresolvedPublicationError) or citation_identifier(page.url):
+                    break
 
     if page_override is not None:
         _run_loop(page_override, stats=None)

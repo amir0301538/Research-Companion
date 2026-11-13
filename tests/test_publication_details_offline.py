@@ -283,6 +283,13 @@ def main() -> int:
 
         def handle_route(route):
             req_url = route.request.url
+            if "view_op=view_citation" not in req_url:
+                route.fulfill(status=200, content_type="text/html", body=(
+                    '<div id="gsc_prf_in">Umar Shahbaz Khan</div><table id="gsc_a_b">'
+                    f'<tr class="gsc_a_tr"><td><a class="gsc_a_at" href="{detail_url_1}">Paper</a></td></tr>'
+                    f'<tr class="gsc_a_tr"><td><a class="gsc_a_at" href="{detail_url_2}">Paper</a></td></tr>'
+                    '</table><button id="gsc_bpf_more" disabled>Show more</button>'))
+                return
             navigated_urls.append(req_url)
             if "nb7KW1ujOQ8C" in req_url:
                 route.fulfill(status=200, content_type="text/html", body=SAMPLE_DETAIL_HTML_1)

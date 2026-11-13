@@ -264,6 +264,14 @@ def main() -> int:
 
             def handle_route(route):
                 u = route.request.url
+                if "view_op=view_citation" not in u:
+                    rows = ''.join(
+                        f'<tr class="gsc_a_tr"><td><a class="gsc_a_at" href="{r["source_url"]}">{r["title"]}</a></td></tr>'
+                        for r in make_profile_for_scholar_a().publications)
+                    route.fulfill(status=200, content_type="text/html", body=(
+                        '<div id="gsc_prf_in">Umar Shahbaz Khan</div><table id="gsc_a_b">'
+                        + rows + '</table><button id="gsc_bpf_more" disabled>Show more</button>'))
+                    return
                 detail_urls_visited.append(u)
                 if "nb7KW1ujOQ8C" in u:
                     route.fulfill(status=200, content_type="text/html", body=SAMPLE_DETAIL_HTML_1)

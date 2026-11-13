@@ -87,6 +87,9 @@ def parse_args():
                    help="Stage 2: sequentially open each unique publication's Google Scholar detail page and extract full metadata.")
     p.add_argument("--detail-delay", type=float, default=4.0,
                    help="Base polite delay in seconds between individual publication detail requests (default: 4.0).")
+    p.add_argument("--interaction-delay", type=float, default=0.5, help="Step 2 interaction delay; minimum 0.5 seconds.")
+    p.add_argument("--post-click-delay", type=float, default=1.0, help="Step 2 delay after title click; minimum 1 second.")
+    p.add_argument("--return-delay", type=float, default=1.0, help="Step 2 delay after returning to profile; minimum 1 second.")
     p.add_argument("--max-details", type=int, default=None,
                    help="Optional safety cap on number of detail pages to fetch in a single run.")
     p.add_argument("--no-detail-resume", action="store_true",
@@ -178,6 +181,9 @@ def _execute_scraper_pipeline(
     scrape_profile_fn=None,
     scrape_details_fn=None,
     manual_cancel_event=None,
+    interaction_delay: float = 0.5,
+    post_click_delay: float = 1.0,
+    return_delay: float = 1.0,
 ) -> PipelineResult:
     """
     Reusable end-to-end execution pipeline shared by the CLI (`run_scraper.py`)
@@ -309,6 +315,8 @@ def _execute_scraper_pipeline(
             if proxy_url is not None:
                 kwargs["proxy_url"] = proxy_url
             if _scrape_details is scrape_publications_details_batch:
+                kwargs["profile_url"] = req_url
+                kwargs.update(interaction_delay=interaction_delay, post_click_delay=post_click_delay, return_delay=return_delay)
                 kwargs["verified_complete_ids"] = set()
             results = _scrape_details(**kwargs)
             transformed = Transformed(timestamp=ts, tables=existing_tables, registry=registry)
@@ -629,6 +637,8 @@ def _execute_scraper_pipeline(
             if proxy_url is not None:
                 det_kwargs["proxy_url"] = proxy_url
             if _scrape_details is scrape_publications_details_batch:
+                det_kwargs["profile_url"] = data.requested_url
+                det_kwargs.update(interaction_delay=interaction_delay, post_click_delay=post_click_delay, return_delay=return_delay)
                 det_kwargs["verified_complete_ids"] = set()
             detail_results = _scrape_details(**det_kwargs)
             apply_publication_details(t, detail_results, existing_detail_tables=existing_detail_tables)
@@ -870,6 +880,9 @@ def main() -> int:
         manual_wait_s=args.manual_wait,
         scrape_details=args.scrape_details,
         detail_delay=args.detail_delay,
+        interaction_delay=args.interaction_delay,
+        post_click_delay=args.post_click_delay,
+        return_delay=args.return_delay,
         max_details=args.max_details,
         detail_resume=not args.no_detail_resume,
     )

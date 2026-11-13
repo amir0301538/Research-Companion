@@ -169,7 +169,7 @@ def test_cancelled_manual_batch_stops_before_next_publication(tmp_path):
     def cancel_once(_page, detail_url, **_kwargs):
         calls.append(detail_url)
         raise ManualVerificationCancelled("cancelled")
-    with patch("scholar_scraper.browser.scrape_publication_detail_on_page", side_effect=cancel_once):
+    with patch("scholar_scraper.browser.ProfileDetailNavigator"), patch("scholar_scraper.browser.scrape_publication_detail_on_page", side_effect=cancel_once):
         result = scrape_publications_details_batch(queue, snapshot, page_override=MagicMock(), delay=0, manual=True)
     saved = json.loads(snapshot.read_text(encoding="utf-8"))
     assert len(calls) == 1

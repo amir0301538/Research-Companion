@@ -1,5 +1,39 @@
 # Google Scholar Profile Scraper → ERD CSV Export
 
+## Step 2 profile-based navigation
+
+For both new and stored scholars, pending details are opened by visiting the
+requested profile, expanding SHOW MORE, and clicking the unique `a.gsc_a_at`
+whose decoded, case-sensitive `citation_for_view` matches the saved URL.
+Row numbers and titles are not identity keys. Missing/ambiguous links or an
+unverifiable opened citation produce `UNRESOLVED` (incomplete), never success.
+A shared publication saved under another scholar's citation key may therefore
+remain unresolved; the scraper does not guess an alternative title match.
+
+The batch uses the existing metadata extractor with `navigate=False`. Its
+standalone direct-navigation default remains for compatibility and parser tests;
+normal CLI/GUI Step 2 never uses that direct-navigation branch. Canonical Scholar
+URLs remain in `source_url` and `publication_url`; publisher links stay separate.
+
+The CLI options `--interaction-delay` (default/minimum 0.5), `--post-click-delay`
+(default/minimum 1.0), and `--return-delay` (default/minimum 1.0) configure the
+navigation pauses in seconds. The GUI uses these defaults. DOM visibility,
+profile ownership, citation identity, and block checks supplement these pauses.
+The existing `--detail-delay` (default 4 seconds) remains between publications.
+
+Dialogs close through their UI control; new tabs close to reveal the profile;
+same-tab pages return using browser history. Retained listings are reused;
+SHOW MORE is repeated only when rows were lost on navigation. Each success is
+checkpointed before returning. Return failures stop the batch without erasing
+that successful record. Existing completed records remain skipped.
+
+HTTP 429/CAPTCHA stops automated requests. In manual mode a recognized challenge
+can be resolved by the user with passive waiting and cancellation; a bare rate
+limit never triggers retries. Unrecognized dialog markup fails safely. Clicking
+does not guarantee Google Scholar access. New scholars still finish the existing
+Step 1 lifecycle before Step 2 launches; persistent mode reuses the dedicated
+profile on disk, not the same open browser context.
+
 ## Desktop workflow and deletion policy
 
 Launch the existing desktop GUI with `python gui_app.py`. STEP 1 stores a new

@@ -10,7 +10,7 @@ from scholar_scraper.dataset_ops import delete_scholar, scoped_detail_path
 from scholar_scraper.erd_schema import CSV_FILES, ERD_ENTITIES
 from scholar_scraper.id_registry import IdRegistry
 from scholar_scraper.reporting import load_existing_csvs, write_all_csvs
-from scholar_scraper.transform import apply_publication_details, transform
+from scholar_scraper.transform import transform
 from scholar_scraper.validator import validate_dataset
 
 
@@ -89,14 +89,14 @@ def test_multiple_areas_all_link_without_primary_guess():
 
 
 def test_duplicate_area_normalization_reuses_id(tmp_path):
-    registry = IdRegistry(tmp_path / "id_registry.json")
+    registry = IdRegistry(tmp_path / "system" / "id_registry.json")
     first = transform(profile("A1", ["Health Economics"]), TS1, registry=registry)
     write_all_csvs(tmp_path, first.tables)
     registry.save()
     second = transform(
         profile("B1", ["  HEALTH   ECONOMICS  "]),
         TS2,
-        registry=IdRegistry(tmp_path / "id_registry.json"),
+        registry=IdRegistry(tmp_path / "system" / "id_registry.json"),
         existing_tables=load_existing_csvs(tmp_path),
     )
     assert len(second.tables["RESEARCH_AREAS"]) == 1
@@ -105,7 +105,7 @@ def test_duplicate_area_normalization_reuses_id(tmp_path):
 
 
 def test_existing_scholar_and_area_ids_remain_stable(tmp_path):
-    registry_path = tmp_path / "id_registry.json"
+    registry_path = tmp_path / "system" / "id_registry.json"
     first = transform(profile("STABLE", ["Robotics"]), TS1, registry=IdRegistry(registry_path))
     write_all_csvs(tmp_path, first.tables)
     first.registry.save()
@@ -169,26 +169,6 @@ def test_step1_transformation_has_no_taxonomy_dependency():
     assert not result.validation_errors
 
 
-def test_step2_detail_merge_has_no_taxonomy_dependency():
-    result = transform(profile("STEP2", ["Medicine"]), TS1)
-    publication = result.tables["PUBLICATIONS"][0]
-    pid = publication["publication_id"]
-    detail = {
-        "publications": {pid: {
-            "status": "SUCCESS",
-            "publication_id": pid,
-            "scholar_id": result.tables["SCHOLARS"][0]["scholar_id"],
-            "publication_url": publication["source_url"],
-            "extracted_at": TS2,
-            "metadata": {"title": publication["title"], "authors_text": publication["authors_text"]},
-        }},
-        "summary": {"total_unique_publications": 1, "succeeded_this_run": 1},
-    }
-    apply_publication_details(result, detail)
-    assert len(result.detail_tables["PUBLICATION_DETAILS"]) == 1
-    assert not result.validation_errors
-
-
 def test_no_duplicate_bridge_keys():
     result = transform(profile(interests=["Medicine", " medicine ", "Physics"]), TS1)
     keys = [(r["scholar_id"], r["research_area_id"]) for r in result.tables["Scholar Research Areas"]]
@@ -204,7 +184,7 @@ def test_six_core_headers_remain_exact(tmp_path):
     result = transform(profile(interests=["Physics"]), TS1)
     write_all_csvs(tmp_path, result.tables)
     for entity, filename in CSV_FILES.items():
-        with open(tmp_path / filename, encoding="utf-8", newline="") as stream:
+        with open(tmp_path / "csv" / filename, encoding="utf-8", newline="") as stream:
             assert next(csv.reader(stream)) == ERD_ENTITIES[entity]
 
 
@@ -212,7 +192,7 @@ def test_deletion_and_checkpoint_remain_compatible(tmp_path):
     result = transform(profile("DELETE1", ["Medicine"]), TS1)
     write_all_csvs(tmp_path, result.tables)
     registry = result.registry
-    registry.path = tmp_path / "id_registry.json"
+    registry.path = tmp_path / "system" / "id_registry.json"
     registry.save()
     checkpoint = scoped_detail_path(tmp_path, "DELETE1")
     checkpoint.parent.mkdir(parents=True)

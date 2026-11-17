@@ -149,7 +149,7 @@ def main() -> int:
     # ----------------------------------------------------------------------- #
     # Test Cases 1, 2, 6, 8, 11, 13 on Scholar 1
     # ----------------------------------------------------------------------- #
-    reg_path = TMP / "id_registry.json"
+    reg_path = TMP / "system" / "id_registry.json"
     reg1 = IdRegistry(reg_path)
     t1 = transform(make_scholar_1(), TS, registry=reg1)
     write_all_csvs(TMP, t1.tables, unresolved_errors=t1.unresolved_errors)
@@ -180,12 +180,12 @@ def main() -> int:
     )
 
     # Test 6: Re-running the scraper preserves all existing IDs
-    first_Export_bytes = {f: (TMP / f).read_bytes() for f in CSV_FILES.values()}
+    first_Export_bytes = {f: (TMP / "csv" / f).read_bytes() for f in CSV_FILES.values()}
     reg1_reload = IdRegistry(reg_path)
     t1_rerun = transform(make_scholar_1(), TS, registry=reg1_reload)
     write_all_csvs(TMP, t1_rerun.tables, unresolved_errors=t1_rerun.unresolved_errors)
     reg1_reload.save()
-    second_export_bytes = {f: (TMP / f).read_bytes() for f in CSV_FILES.values()}
+    second_export_bytes = {f: (TMP / "csv" / f).read_bytes() for f in CSV_FILES.values()}
     check(
         "6. Re-running the scraper preserves all existing IDs and produces identical CSVs",
         first_Export_bytes == second_export_bytes
@@ -281,7 +281,7 @@ def main() -> int:
     val_errors = validate_dataset(t_multi.tables, unresolved_errors=t_multi.unresolved_errors)
     headers_ok = True
     for ent, fname in CSV_FILES.items():
-        with open(TMP / fname, encoding="utf-8", newline="") as f:
+        with open(TMP / "csv" / fname, encoding="utf-8", newline="") as f:
             header = next(csv.reader(f))
         headers_ok &= header == ERD_ENTITIES[ent]
     check(

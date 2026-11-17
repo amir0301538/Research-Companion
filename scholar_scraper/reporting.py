@@ -15,19 +15,20 @@ from typing import Optional
 
 from .browser import redact_url
 from .erd_schema import CSV_FILES, DETAIL_CSV_FILES, DETAIL_ENTITIES, ERD_ENTITIES
+from .output_paths import OutputPaths
 from .validator import DatasetValidationError, validate_dataset
 
 log = logging.getLogger(__name__)
 
 SUCCESS, PARTIAL, UNAVAILABLE, SYSTEM = "SUCCESS", "PARTIAL", "UNAVAILABLE", "SYSTEM"
-DB_ID = "Persistent ID Registry (output/id_registry.json)"
+DB_ID = "Persistent ID Registry (output/system/id_registry.json)"
 
 
 class CsvPermissionError(PermissionError):
     """
     Raised when a CSV file in the output directory cannot be read or written
     due to an operating-system file lock or permission restriction (e.g., when
-    `output/scholars.csv` is open in Microsoft Excel or locked by another process).
+    `output/csv/scholars.csv` is open in Microsoft Excel or locked by another process).
     """
 
     def __init__(self, file_path: Path, operation: str = "access", original_error: Optional[Exception] = None):
@@ -52,7 +53,7 @@ def find_existing_scholar_by_google_id(out_dir: Path, google_scholar_id: str) ->
     target_id = (google_scholar_id or "").strip()
     if not target_id or not out_dir:
         return None
-    fpath = Path(out_dir) / CSV_FILES["SCHOLARS"]
+    fpath = OutputPaths(out_dir).csv(CSV_FILES["SCHOLARS"])
     if not fpath.exists():
         return None
     try:
@@ -75,9 +76,10 @@ def verify_csv_files_writable(out_dir: Path, include_details: bool = False):
     if not out_dir or not Path(out_dir).exists():
         return
     out_path = Path(out_dir)
-    files_to_check = [out_path / fname for fname in CSV_FILES.values()]
+    paths = OutputPaths(out_path)
+    files_to_check = [paths.csv(fname) for fname in CSV_FILES.values()]
     if include_details:
-        sup_dir = out_path / "supplementary"
+        sup_dir = paths.historical
         files_to_check.extend(sup_dir / fname for fname in DETAIL_CSV_FILES.values())
     for fpath in files_to_check:
         if fpath.exists():
@@ -108,7 +110,7 @@ def load_existing_csvs(out_dir: Path) -> dict[str, list[dict]]:
     if not out_dir or not out_dir.exists():
         return loaded
     for entity, fname in CSV_FILES.items():
-        fpath = out_dir / fname
+        fpath = OutputPaths(out_dir).csv(fname)
         if fpath.exists():
             try:
                 with open(fpath, "r", encoding="utf-8", newline="") as f:
@@ -120,11 +122,11 @@ def load_existing_csvs(out_dir: Path) -> dict[str, list[dict]]:
 
 def load_existing_detail_csvs(out_dir: Path) -> dict[str, list[dict]]:
     """
-    Read existing Stage-2 detail CSVs from `out_dir/supplementary` so previously
+    Read historical detail CSVs from `out_dir/system/historical` so previously
     exported publication details and yearly citations are preserved across runs.
     """
     loaded: dict[str, list[dict]] = {entity: [] for entity in DETAIL_CSV_FILES}
-    sup_dir = out_dir / "supplementary" if out_dir else None
+    sup_dir = OutputPaths(out_dir).historical if out_dir else None
     if not sup_dir or not sup_dir.exists():
         return loaded
     for entity, fname in DETAIL_CSV_FILES.items():
@@ -170,13 +172,14 @@ def write_all_csvs(
     try:
         staged_pairs = []
         for entity, fname in CSV_FILES.items():
-            target = out_dir / fname
+            target = OutputPaths(out_dir).csv(fname)
             staged_path = staging_dir / fname
             write_csv(staged_path, ERD_ENTITIES[entity], tables.get(entity, []))
+            target.parent.mkdir(parents=True, exist_ok=True)
             staged_pairs.append((entity, fname, staged_path, target))
 
         if detail_tables:
-            sup_dir = out_dir / "supplementary"
+            sup_dir = OutputPaths(out_dir).historical
             sup_dir.mkdir(parents=True, exist_ok=True)
             for d_entity, d_fname in DETAIL_CSV_FILES.items():
                 if d_entity in detail_tables:
@@ -213,7 +216,7 @@ def write_all_csvs(
 
 
 def write_supplementary(out_dir: Path, linkage, raw: dict):
-    sup = out_dir / "supplementary"
+    sup = OutputPaths(out_dir).system_dir
     sup.mkdir(parents=True, exist_ok=True)
     write_csv(
         sup / "record_linkage.csv",
@@ -224,7 +227,7 @@ def write_supplementary(out_dir: Path, linkage, raw: dict):
     # snapshots are keyed by Google Scholar ID and never overwrite another scholar.
     gs_id = (raw.get("google_scholar_id") or "").strip()
     if gs_id and all(c.isalnum() or c in "_-" for c in gs_id):
-        profile_dir = sup / "profiles"
+        profile_dir = OutputPaths(out_dir).snapshots / "profiles"
         profile_dir.mkdir(parents=True, exist_ok=True)
         target = profile_dir / f"{gs_id}.json"
         staged = target.with_suffix(".json.tmp")

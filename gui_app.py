@@ -38,6 +38,9 @@ from scholar_scraper.reporting import (
     verify_csv_files_writable,
 )
 from scholar_scraper.dataset_ops import delete_scholar, preview_deletion
+from scholar_scraper.output_migration import migrate_output
+from scholar_scraper.output_paths import OutputPaths
+from scholar_scraper.refresh_all import refresh_all, stored_profiles
 
 PLACEHOLDER_TEXT = "Paste Google Scholar Profile URL here..."
 
@@ -45,7 +48,7 @@ PLACEHOLDER_TEXT = "Paste Google Scholar Profile URL here..."
 def format_already_stored_notification(existing_row: dict) -> str:
     """
     Build the exact formatted GUI notification when a Google Scholar profile
-    already exists in `output/scholars.csv`.
+    already exists in `output/csv/scholars.csv`.
     """
     scholar_name = (existing_row.get("scholar_name") or "").strip() or "Unknown"
     gs_id = (existing_row.get("google_scholar_id") or "").strip()
@@ -145,13 +148,18 @@ class ScholarScraperGUI:
         pipeline_runner: Optional[Callable[..., PipelineResult]] = None,
         show_dialogs: bool = True,
         confirm_delete_fn: Optional[Callable[[str, str], bool]] = None,
+        confirm_refresh_fn: Optional[Callable[[str, str], bool]] = None,
     ):
         self.root = root
         self.output_dir = Path(output_dir)
+        migrate_output(self.output_dir)
+        self.paths = OutputPaths(self.output_dir)
         self.docx_path = Path(docx_path)
         self.pipeline_runner = pipeline_runner or execute_scraper_pipeline
         self.show_dialogs = show_dialogs
         self.confirm_delete_fn = confirm_delete_fn
+        self.confirm_refresh_fn = confirm_refresh_fn
+        self.refresh_cancel_event = threading.Event()
 
         self.event_queue: "queue.Queue[dict]" = queue.Queue()
         self.worker_thread: Optional[threading.Thread] = None
@@ -166,9 +174,9 @@ class ScholarScraperGUI:
         # Attach thread-safe log handler to root logger so all `scholar_scraper` and `run_scraper` logs appear live
         self.log_handler = QueueLogHandler(self.event_queue)
         self.log_handler.setLevel(logging.INFO)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.paths.logs_dir.mkdir(parents=True, exist_ok=True)
         self.file_log_handler = logging.FileHandler(
-            self.output_dir / "scraper.log", mode="a", encoding="utf-8"
+            self.paths.log(), mode="a", encoding="utf-8"
         )
         self.file_log_handler.setLevel(logging.INFO)
         self.file_log_handler.setFormatter(logging.Formatter(
@@ -224,7 +232,7 @@ class ScholarScraperGUI:
 
         subtitle_lbl = tk.Label(
             header_frame,
-            text="Extract researcher profiles, publications, and publication details.",
+            text="Extract researcher profiles and complete front-page publication listings.",
             font=("Segoe UI", 10),
             fg="#94A3B8",
             bg="#0F172A",
@@ -388,6 +396,15 @@ class ScholarScraperGUI:
 
         self._set_placeholder()
 
+        export_card = tk.LabelFrame(main_frame, text=" 2. Export Format ",
+                                    font=("Segoe UI", 10, "bold"), fg="#1E293B",
+                                    bg="#FFFFFF", padx=16, pady=8)
+        export_card.pack(fill=tk.X, pady=(0, 12))
+        self.export_format_var = tk.StringVar(value="CSV")
+        for label in ("CSV", "JSON"):
+            tk.Radiobutton(export_card, text=label, variable=self.export_format_var,
+                           value=label, bg="#FFFFFF", font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 24))
+
         # ---------------- C. SCRAPING AND DELETION BUTTONS ----------------
         btn_card = tk.Frame(main_frame, bg="#F4F6F9")
         btn_card.pack(fill=tk.X, pady=(0, 12))
@@ -396,11 +413,11 @@ class ScholarScraperGUI:
 
         # Button 1 Frame (Step 1 — Profile Scraping)
         b1_box = tk.Frame(btn_card, bg="#FFFFFF", bd=1, relief=tk.SOLID, padx=12, pady=10)
-        b1_box.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
+        b1_box.grid(row=0, column=0, columnspan=2, sticky="nsew")
 
         self.step1_btn = tk.Button(
             b1_box,
-            text="STEP 1 — PROFILE SCRAPING",
+            text="SCRAPE SCHOLAR PROFILE",
             command=self.start_step1_profile_scraping,
             font=("Segoe UI", 11, "bold"),
             fg="#FFFFFF",
@@ -425,37 +442,6 @@ class ScholarScraperGUI:
             justify=tk.LEFT,
         ).pack(fill=tk.X, pady=(6, 0))
 
-        # Button 2 Frame (Step 2 — Full Publication Scraping - Emphasized)
-        b2_box = tk.Frame(btn_card, bg="#FFFFFF", bd=2, relief=tk.SOLID, padx=12, pady=10)
-        b2_box.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
-
-        self.step2_btn = tk.Button(
-            b2_box,
-            text="STEP 2 — FULL PUBLICATION SCRAPING",
-            command=self.start_step2_full_scraping,
-            font=("Segoe UI", 11, "bold"),
-            fg="#FFFFFF",
-            bg="#15803D",
-            activeforeground="#FFFFFF",
-            activebackground="#166534",
-            disabledforeground="#E2E8F0",
-            relief=tk.FLAT,
-            cursor="hand2",
-            pady=8,
-        )
-        self.step2_btn.pack(fill=tk.X)
-
-        tk.Label(
-            b2_box,
-            text="COMPLETE PIPELINE: Runs STEP 1 first AND sequentially visits every individual publication "
-                 "detail page (with checkpoint/resume & yearly citations).",
-            font=("Segoe UI", 8, "bold"),
-            fg="#166534",
-            bg="#FFFFFF",
-            wraplength=380,
-            justify=tk.LEFT,
-        ).pack(fill=tk.X, pady=(6, 0))
-
         self.delete_btn = tk.Button(
             btn_card, text="DELETE SCHOLAR", command=self.start_delete_scholar,
             font=("Segoe UI", 11, "bold"), fg="#FFFFFF", bg="#B91C1C",
@@ -463,11 +449,23 @@ class ScholarScraperGUI:
             disabledforeground="#E2E8F0", relief=tk.FLAT, cursor="hand2", pady=8,
         )
         self.delete_btn.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.refresh_btn = tk.Button(
+            btn_card, text="REFRESH ALL SCHOLARS", command=self.start_refresh_all_scholars,
+            font=("Segoe UI", 11, "bold"), fg="#FFFFFF", bg="#D97706",
+            activeforeground="#FFFFFF", activebackground="#B45309",
+            disabledforeground="#E2E8F0", relief=tk.FLAT, cursor="hand2", pady=8,
+        )
+        self.refresh_btn.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.stop_refresh_btn = tk.Button(
+            btn_card, text="STOP AFTER CURRENT SCHOLAR", command=self.stop_refresh,
+            font=("Segoe UI", 9, "bold"), fg="#FFFFFF", bg="#475569",
+            relief=tk.FLAT, cursor="hand2", pady=5,
+        )
 
         # ---------------- D. PROGRESS & STATUS DASHBOARD ----------------
         status_card = tk.LabelFrame(
             main_frame,
-            text=" 2. Scraping Progress & Status ",
+            text=" 3. Scraping Progress & Status ",
             font=("Segoe UI", 10, "bold"),
             fg="#1E293B",
             bg="#FFFFFF",
@@ -487,12 +485,9 @@ class ScholarScraperGUI:
         self.status_var = tk.StringVar(value="Idle")
         self.pubs_found_var = tk.StringVar(value="0")
         self.pubs_processed_var = tk.StringVar(value="0")
-        self.details_scraped_var = tk.StringVar(value="0")
-        self.pubs_pending_var = tk.StringVar(value="0")
-        self.current_pub_var = tk.StringVar(value="None")
         self.progress_pct_var = tk.DoubleVar(value=0.0)
         self.progress_label_var = tk.StringVar(value="0%")
-        self.banner_message_var = tk.StringVar(value="Ready. Paste a Google Scholar profile URL above and select Step 1 or Step 2.")
+        self.banner_message_var = tk.StringVar(value="Ready. Paste a Google Scholar profile URL and select an export format.")
 
         # Row 0: Researcher & Status
         self._add_metric_pair(grid_frame, 0, 0, "Researcher:", self.researcher_var, bold=True)
@@ -502,28 +497,22 @@ class ScholarScraperGUI:
         self._add_metric_pair(grid_frame, 1, 0, "Publications Found:", self.pubs_found_var)
         self._add_metric_pair(grid_frame, 1, 2, "Publications Processed:", self.pubs_processed_var)
 
-        # Row 2: Details Scraped & Pending Publications
-        self._add_metric_pair(grid_frame, 2, 0, "Details Scraped:", self.details_scraped_var)
-        self._add_metric_pair(grid_frame, 2, 2, "Pending Publications:", self.pubs_pending_var)
-
-        # Row 3: Current Publication in Step 2
-        cur_row = tk.Frame(status_card, bg="#FFFFFF")
-        cur_row.pack(fill=tk.X, pady=(6, 4))
-        tk.Label(
-            cur_row,
-            text="Current Publication (Step 2):",
-            font=("Segoe UI", 9, "bold"),
-            fg="#475569",
-            bg="#FFFFFF",
-        ).pack(side=tk.LEFT)
-        tk.Label(
-            cur_row,
-            textvariable=self.current_pub_var,
-            font=("Segoe UI", 9),
-            fg="#0F172A",
-            bg="#FFFFFF",
-            anchor="w",
-        ).pack(side=tk.LEFT, padx=(8, 0), fill=tk.X, expand=True)
+        self.image_status_var = tk.StringVar(value="—")
+        self.export_status_var = tk.StringVar(value="CSV")
+        self.show_more_var = tk.StringVar(value="0")
+        self.refresh_current_var = tk.StringVar(value="—")
+        self.refresh_success_var = tk.StringVar(value="0")
+        self.refresh_failed_var = tk.StringVar(value="0")
+        self.refresh_skipped_var = tk.StringVar(value="0")
+        self.changed_records_var = tk.StringVar(value="0")
+        self._add_metric_pair(grid_frame, 2, 0, "Profile Image:", self.image_status_var)
+        self._add_metric_pair(grid_frame, 2, 2, "Export Format:", self.export_status_var)
+        self._add_metric_pair(grid_frame, 3, 0, "SHOW MORE Clicks:", self.show_more_var)
+        self._add_metric_pair(grid_frame, 3, 2, "Refresh Scholar:", self.refresh_current_var)
+        self._add_metric_pair(grid_frame, 4, 0, "Refreshed:", self.refresh_success_var)
+        self._add_metric_pair(grid_frame, 4, 2, "Failed:", self.refresh_failed_var)
+        self._add_metric_pair(grid_frame, 5, 0, "Skipped:", self.refresh_skipped_var)
+        self._add_metric_pair(grid_frame, 5, 2, "Changed Records:", self.changed_records_var)
 
         # Row 4: Progress Bar + Percentage
         prog_row = tk.Frame(status_card, bg="#FFFFFF")
@@ -734,8 +723,8 @@ class ScholarScraperGUI:
     def _set_buttons_enabled(self, enabled: bool):
         state = tk.NORMAL if enabled else tk.DISABLED
         self.step1_btn.configure(state=state)
-        self.step2_btn.configure(state=state)
         self.delete_btn.configure(state=state)
+        self.refresh_btn.configure(state=state)
         self.url_entry.configure(state=state)
         if enabled:
             self._on_connection_mode_changed()
@@ -762,28 +751,16 @@ class ScholarScraperGUI:
         self.append_log("Manual verification cancellation requested by user.")
 
     # ------------------------------------------------------------------ #
-    # Button Actions (Step 1 & Step 2)
+    # Front-page scraping and deletion actions
     # ------------------------------------------------------------------ #
     def start_step1_profile_scraping(self) -> bool:
         """
-        BUTTON 1: STEP 1 — PROFILE SCRAPING
-        Extracts profile info + all publications via dynamic SHOW MORE, applies CSV
-        deduplication & scholar-scoped clean re-scraping, and writes CSVs + quality report.
-        Does NOT open individual publication detail pages.
+        Scrape profile information and all SHOW MORE publication rows.
+        The worker exports CSV and JSON representations without opening title links.
         """
-        return self._start_scraping_job(scrape_details=False)
+        return self._start_scraping_job()
 
-    def start_step2_full_scraping(self) -> bool:
-        """
-        BUTTON 2: STEP 2 — FULL PUBLICATION SCRAPING
-        Automatically executes STEP 1 first, then sequentially visits every individual
-        publication detail page (`view_op=view_citation`), extracts full metadata +
-        exact year-wise citations, updates PUBLICATIONS/author_order, and supports
-        checkpoint/resume.
-        """
-        return self._start_scraping_job(scrape_details=True)
-
-    def _confirm_deletion_dialog(self, title: str, message: str) -> bool:
+    def _confirm_deletion_dialog(self, title: str, message: str, action_label="Confirm Delete") -> bool:
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
         dialog.transient(self.root)
@@ -800,7 +777,7 @@ class ScholarScraperGUI:
             dialog.destroy()
         tk.Button(controls, text="Cancel", command=lambda: close(False),
                   font=("Segoe UI", 10), padx=14, pady=6).pack(side=tk.RIGHT, padx=(8, 0))
-        tk.Button(controls, text="Confirm Delete", command=lambda: close(True),
+        tk.Button(controls, text=action_label, command=lambda: close(True),
                   font=("Segoe UI", 10, "bold"), bg="#B91C1C", fg="#FFFFFF",
                   activebackground="#991B1B", activeforeground="#FFFFFF",
                   padx=14, pady=6).pack(side=tk.RIGHT)
@@ -873,7 +850,75 @@ class ScholarScraperGUI:
             if not self.is_running and self.run_lock.locked():
                 self.run_lock.release()
 
-    def _start_scraping_job(self, scrape_details: bool) -> bool:
+    def stop_refresh(self):
+        self.refresh_cancel_event.set()
+        self.status_var.set("Stopping after current scholar...")
+        self._set_banner("The current scholar will finish safely; remaining profiles will be skipped.", kind="warning")
+
+    def start_refresh_all_scholars(self) -> bool:
+        if self.is_running or not self.run_lock.acquire(blocking=False):
+            return False
+        try:
+            ready, skipped = stored_profiles(self.output_dir)
+            total = len(ready) + len(skipped)
+            message = (
+                f"Total stored scholars: {total}\n"
+                f"Profile URLs available: {len(ready)}\n"
+                f"Refresh scope: {len(ready)} scholar profiles\n\n"
+                "This operation will revisit each saved Google Scholar profile, "
+                "recheck front-page information, and update changed records in "
+                "both CSV and JSON datasets."
+            )
+            confirmed = (self.confirm_refresh_fn("Refresh All Stored Scholars?", message)
+                         if self.confirm_refresh_fn else
+                         self._confirm_deletion_dialog("Refresh All Stored Scholars?", message, "Start Refresh")
+                         if self.show_dialogs else False)
+            if not confirmed:
+                self.status_var.set("Refresh Cancelled")
+                self._set_banner("Refresh cancelled. No profiles were visited.", kind="info")
+                return False
+            self.is_running = True
+            self.refresh_cancel_event.clear()
+            self._set_buttons_enabled(False)
+            self.stop_refresh_btn.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+            self.refresh_current_var.set(f"0 / {len(ready)}")
+            self.refresh_success_var.set("0")
+            self.refresh_failed_var.set("0")
+            self.refresh_skipped_var.set(str(len(skipped)))
+            self.changed_records_var.set("0")
+            self.progress_pct_var.set(0)
+            self.status_var.set("Refreshing stored scholars...")
+            use_persistent = bool(self.persistent_var.get())
+            use_headed = bool(self.headed_var.get()) or bool(self.manual_var.get())
+            use_manual = bool(self.manual_var.get())
+            selected_format = self.export_format_var.get()
+            proxy = self.get_effective_proxy_url()
+            def worker():
+                try:
+                    report = refresh_all(
+                        self.output_dir, cancel_event=self.refresh_cancel_event,
+                        progress_callback=lambda event: self.event_queue.put({"type": "progress", "data": event}),
+                        headed=use_headed, persistent=use_persistent,
+                        user_data_dir=(HERE / ".chrome_profile") if use_persistent else None,
+                        manual=use_manual, export_format=selected_format, proxy_url=proxy,
+                    )
+                    self.event_queue.put({"type": "refresh_done", "report": report})
+                except Exception as error:
+                    self.event_queue.put({"type": "refresh_error", "error": str(error)})
+            self.worker_thread = threading.Thread(target=worker, daemon=True)
+            self.worker_thread.start()
+            return True
+        except Exception as error:
+            self.status_var.set("Refresh Failed Safely")
+            self._set_banner(str(error), kind="error")
+            if self.show_dialogs:
+                messagebox.showerror("Refresh Failed", str(error), parent=self.root)
+            return False
+        finally:
+            if not self.is_running and self.run_lock.locked():
+                self.run_lock.release()
+
+    def _start_scraping_job(self) -> bool:
         if self.is_running or not self.run_lock.acquire(blocking=False):
             return False
 
@@ -918,7 +963,6 @@ class ScholarScraperGUI:
                     self.status_val_lbl.configure(fg="#DC2626")
                     self.progress_pct_var.set(0.0)
                     self.progress_label_var.set("0%")
-                    self.current_pub_var.set("None — Check proxy settings or select Direct Connection")
                     self.last_notification_text = err_msg
                     self._set_banner(err_msg, kind="error")
                     self.append_log(f"PROXY CONFIG ERROR: {err_msg}")
@@ -947,7 +991,6 @@ class ScholarScraperGUI:
                     self.status_val_lbl.configure(fg="#DC2626")
                     self.progress_pct_var.set(0.0)
                     self.progress_label_var.set("0%")
-                    self.current_pub_var.set("None — Check proxy settings or select Direct Connection")
                     self.last_notification_text = err_msg
                     self._set_banner(err_msg, kind="error")
                     self.append_log(f"PROXY CONFIG ERROR: {err_msg}")
@@ -956,14 +999,14 @@ class ScholarScraperGUI:
                     self.run_lock.release()
                     return False
 
-            # ---- 1. Check whether this google_scholar_id already exists in output/scholars.csv ----
+            # ---- 1. Check whether this google_scholar_id already exists in output/csv/scholars.csv ----
             try:
                 existing_row = find_existing_scholar_by_google_id(self.output_dir, gs_id)
             except (CsvPermissionError, PermissionError) as perm_exc:
                 perm_err = (
                     perm_exc
                     if isinstance(perm_exc, CsvPermissionError)
-                    else CsvPermissionError(self.output_dir / "scholars.csv", operation="read", original_error=perm_exc)
+                    else CsvPermissionError(self.paths.csv("scholars.csv"), operation="read", original_error=perm_exc)
                 )
                 err_msg = str(perm_err)
                 self.last_existing_scholar = None
@@ -980,9 +1023,6 @@ class ScholarScraperGUI:
                 self.status_val_lbl.configure(fg="#DC2626")
                 self.pubs_found_var.set("0")
                 self.pubs_processed_var.set("0")
-                self.details_scraped_var.set("0")
-                self.pubs_pending_var.set("0")
-                self.current_pub_var.set("None — Please close Excel or any app locking output/scholars.csv")
                 self.progress_pct_var.set(0.0)
                 self.progress_label_var.set("0%")
                 self._set_banner(f"CSV File Locked / Permission Denied:\n{err_msg}", kind="error")
@@ -992,7 +1032,7 @@ class ScholarScraperGUI:
                 self.run_lock.release()
                 return False
 
-            if existing_row is not None and not scrape_details:
+            if existing_row is not None and self.export_format_var.get() == "CSV":
                 scholar_name = (existing_row.get("scholar_name") or "").strip() or "Unknown"
                 scholar_id = str(existing_row.get("scholar_id") or "").strip()
                 total_pubs_str = str(existing_row.get("total_publications") or "0").strip()
@@ -1015,15 +1055,12 @@ class ScholarScraperGUI:
                 self.status_val_lbl.configure(fg="#B45309")
                 self.pubs_found_var.set(total_pubs_str if total_pubs_str.isdigit() else "0")
                 self.pubs_processed_var.set("0 (Skipped — Already Stored)")
-                self.details_scraped_var.set("0")
-                self.pubs_pending_var.set("0")
-                self.current_pub_var.set("None — Scraping skipped (scholar already exists in output/scholars.csv)")
                 self.progress_pct_var.set(100.0)
                 self.progress_label_var.set("100%")
                 self._set_banner(notice_text, kind="warning")
                 self.append_log(
                     f"Duplicate check: Google Scholar ID '{gs_id}' ({scholar_name}, scholar_id={scholar_id}) "
-                    "already exists in output/scholars.csv. No new scraping or CSV modifications were performed."
+                    "already exists in the stored scholar CSV. No new scraping or CSV modifications were performed."
                 )
                 if self.show_dialogs:
                     messagebox.showwarning("Scholar Already Stored", notice_text, parent=self.root)
@@ -1032,12 +1069,12 @@ class ScholarScraperGUI:
 
             # ---- 2. Verify CSV files are not locked by Excel/another process before starting browser ----
             try:
-                verify_csv_files_writable(self.output_dir, include_details=scrape_details)
+                verify_csv_files_writable(self.output_dir)
             except (CsvPermissionError, PermissionError) as perm_exc:
                 perm_err = (
                     perm_exc
                     if isinstance(perm_exc, CsvPermissionError)
-                    else CsvPermissionError(self.output_dir / "scholars.csv", operation="write to", original_error=perm_exc)
+                    else CsvPermissionError(self.paths.csv("scholars.csv"), operation="write to", original_error=perm_exc)
                 )
                 err_msg = str(perm_err)
                 self.last_existing_scholar = None
@@ -1054,9 +1091,6 @@ class ScholarScraperGUI:
                 self.status_val_lbl.configure(fg="#DC2626")
                 self.pubs_found_var.set("0")
                 self.pubs_processed_var.set("0")
-                self.details_scraped_var.set("0")
-                self.pubs_pending_var.set("0")
-                self.current_pub_var.set("None — Please close Excel or any app locking output/scholars.csv")
                 self.progress_pct_var.set(0.0)
                 self.progress_label_var.set("0%")
                 self._set_banner(f"CSV File Locked / Permission Denied:\n{err_msg}", kind="error")
@@ -1072,22 +1106,16 @@ class ScholarScraperGUI:
             self.last_existing_scholar = None
             self.last_notification_text = ""
             self._set_buttons_enabled(False)
-            mode_name = "STEP 2 — FULL PUBLICATION SCRAPING" if scrape_details else "STEP 1 — PROFILE SCRAPING"
+            mode_name = "PROFILE SCRAPING"
             self.status_var.set(f"Running {mode_name}...")
             self.status_val_lbl.configure(fg="#1D4ED8")
             self.researcher_var.set(f"Loading ({gs_id})...")
             self.pubs_found_var.set("0")
             self.pubs_processed_var.set("0")
-            self.details_scraped_var.set("0")
-            self.pubs_pending_var.set("0")
-            self.current_pub_var.set("Initializing browser..." if scrape_details else "N/A (Step 1 Profile Only)")
             self.progress_pct_var.set(2.0)
             self.progress_label_var.set("2%")
             self._set_banner(
-                (f"Scholar Already Stored — Continuing Publication Detail Scraping for {existing_row['scholar_name']}."
-                 if scrape_details and existing_row else
-                 f"Started {mode_name} for Google Scholar ID '{gs_id}'. Please wait while the browser extracts data..."),
-                kind="running",
+                f"Started {mode_name} for Google Scholar ID '{gs_id}'.", kind="running",
             )
             self.append_log(
                 f"Starting {mode_name} for URL: {raw_url} (user={gs_id}, "
@@ -1097,6 +1125,7 @@ class ScholarScraperGUI:
             use_persistent = bool(self.persistent_var.get())
             use_headed = bool(self.headed_var.get()) or bool(self.manual_var.get())
             use_manual = bool(self.manual_var.get())
+            selected_export_format = self.export_format_var.get()
 
             def _worker():
                 try:
@@ -1109,7 +1138,7 @@ class ScholarScraperGUI:
                         user_data_dir=(HERE / ".chrome_profile") if use_persistent else None,
                         manual=use_manual,
                         manual_cancel_event=self.manual_cancel_event,
-                        scrape_details=scrape_details,
+                        export_format=selected_export_format,
                         progress_callback=lambda ev: self.event_queue.put({"type": "progress", "data": ev}),
                     )
                     if effective_proxy is not None:
@@ -1159,6 +1188,42 @@ class ScholarScraperGUI:
                 self._handle_delete_done(item.get("result"))
             elif etype == "delete_error":
                 self._handle_delete_error(item.get("error") or "Unknown deletion error")
+            elif etype == "refresh_done":
+                self._handle_refresh_done(item["report"])
+            elif etype == "refresh_error":
+                self._handle_refresh_error(item.get("error") or "Unknown refresh error")
+
+    def _handle_refresh_done(self, report):
+        self.is_running = False
+        if self.run_lock.locked():
+            self.run_lock.release()
+        self._set_buttons_enabled(True)
+        self.stop_refresh_btn.grid_remove()
+        self._show_manual_cancel(False)
+        self.refresh_success_var.set(str(report["successfully_refreshed"]))
+        self.refresh_failed_var.set(str(report["failed"]))
+        self.refresh_skipped_var.set(str(report["skipped"]))
+        self.changed_records_var.set(str(report["changed_records"]))
+        self.status_var.set(f"Refresh {report['status'].replace('_', ' ').title()}")
+        summary = (f"Refresh {report['status'].lower()}: {report['successfully_refreshed']} succeeded, "
+                   f"{report['failed']} failed, {report['blocked']} blocked, "
+                   f"{report['skipped']} skipped. Changed records: {report['changed_records']}. "
+                   f"Report: {self.paths.report('refresh_all_report.json')}")
+        self._set_banner(summary, kind="success" if report["status"] == "COMPLETED" else "warning")
+        self.append_log(summary)
+        if self.show_dialogs:
+            messagebox.showinfo("Refresh All Scholars", summary, parent=self.root)
+
+    def _handle_refresh_error(self, message):
+        self.is_running = False
+        if self.run_lock.locked():
+            self.run_lock.release()
+        self._set_buttons_enabled(True)
+        self.stop_refresh_btn.grid_remove()
+        self._show_manual_cancel(False)
+        self.status_var.set("Refresh Failed Safely")
+        self._set_banner(message, kind="error")
+        self.append_log(f"REFRESH FAILED: {message}")
 
     def _finish_delete(self):
         self.is_running = False
@@ -1198,6 +1263,11 @@ class ScholarScraperGUI:
 
     def _handle_progress_event(self, ev: dict):
         phase = ev.get("phase", "")
+        if phase == "refresh_start":
+            self.pubs_found_var.set("0")
+            self.pubs_processed_var.set("0")
+            self.show_more_var.set("0")
+            self.image_status_var.set("—")
         if phase in ("manual_verification_required", "manual_verification_waiting"):
             self._show_manual_cancel(True)
         elif phase in ("manual_verification_succeeded", "manual_verification_cancelled",
@@ -1207,17 +1277,26 @@ class ScholarScraperGUI:
             self.researcher_var.set(ev["researcher_name"])
         if ev.get("status"):
             self.status_var.set(ev["status"])
+        if ev.get("google_scholar_id"):
+            self.scholar_id_badge_var.set(f"Scholar ID: {ev['google_scholar_id']}")
+        if "current_scholar" in ev:
+            self.refresh_current_var.set(f"{ev['current_scholar']} / {ev.get('total_scholars', '?')}")
+        if "successful_refreshes" in ev:
+            self.refresh_success_var.set(str(ev["successful_refreshes"]))
+        if "failed_refreshes" in ev:
+            self.refresh_failed_var.set(str(ev["failed_refreshes"]))
+        if "skipped_scholars" in ev:
+            self.refresh_skipped_var.set(str(ev["skipped_scholars"]))
+        if "changed_records" in ev:
+            self.changed_records_var.set(str(ev["changed_records"]))
         if "publications_found" in ev and ev["publications_found"] is not None:
             self.pubs_found_var.set(str(ev["publications_found"]))
         if "publications_processed" in ev and ev["publications_processed"] is not None:
             self.pubs_processed_var.set(str(ev["publications_processed"]))
-        if "details_scraped" in ev and ev["details_scraped"] is not None:
-            self.details_scraped_var.set(str(ev["details_scraped"]))
-        if "pending_publications" in ev and ev["pending_publications"] is not None:
-            self.pubs_pending_var.set(str(ev["pending_publications"]))
-        if ev.get("current_publication_title"):
-            pid_prefix = f"[#{ev['current_publication_id']}] " if ev.get("current_publication_id") else ""
-            self.current_pub_var.set(f"{pid_prefix}{ev['current_publication_title']}")
+        if "show_more_clicks" in ev:
+            self.show_more_var.set(str(ev["show_more_clicks"]))
+        if "image_status" in ev:
+            self.image_status_var.set(ev["image_status"])
         if "progress_pct" in ev and ev["progress_pct"] is not None:
             pct = max(0.0, min(100.0, float(ev["progress_pct"])))
             self.progress_pct_var.set(pct)
@@ -1243,8 +1322,9 @@ class ScholarScraperGUI:
             self.researcher_var.set(res.researcher_name)
         self.pubs_found_var.set(str(res.publications_found))
         self.pubs_processed_var.set(str(res.publications_processed))
-        self.details_scraped_var.set(str(res.details_scraped))
-        self.pubs_pending_var.set(str(res.pending_publications))
+        self.image_status_var.set(res.image_status or "—")
+        self.export_status_var.set(res.export_format)
+        self.show_more_var.set(str(res.show_more_clicks))
 
         raw_msg = res.message or ""
         upper_msg = raw_msg.upper()
@@ -1272,7 +1352,6 @@ class ScholarScraperGUI:
             self.status_val_lbl.configure(fg="#DC2626")
             self.progress_pct_var.set(0.0)
             self.progress_label_var.set("0%")
-            self.current_pub_var.set("None — Check proxy settings or select Direct Connection")
 
             lines = [SUGGESTED_PROXY_ERROR_MESSAGE, ""]
             lines.append("Failure Cause: Proxy Configuration / Proxy Connection Failure")
@@ -1299,7 +1378,6 @@ class ScholarScraperGUI:
             self.status_val_lbl.configure(fg="#DC2626")
             self.progress_pct_var.set(0.0)
             self.progress_label_var.set("0%")
-            self.current_pub_var.set("None — Check your internet connection and try again")
 
             net_lines = [
                 "Unable to connect to Google Scholar due to a general network connectivity failure. "
@@ -1336,31 +1414,15 @@ class ScholarScraperGUI:
             self.append_log(f"MANUAL VERIFICATION UNSUCCESSFUL: {res.message}")
             if self.show_dialogs:
                 messagebox.showwarning("Manual Verification Unsuccessful", res.message, parent=self.root)
-        elif res.stopped_by_block or res.status in ("BLOCKED", "BLOCKED_PARTIAL"):
-            block_kind = (res.detail_summary or {}).get("block_kind") or "blocked"
-            if block_kind == "captcha":
-                block_status = "Paused — CAPTCHA Requires Manual Verification"
-            elif block_kind in ("http_429", "http_429_no_challenge"):
-                block_status = "Paused — HTTP 429 Rate Limit"
-            else:
-                block_status = "Paused — Google Access Restriction"
-            self.status_var.set(block_status)
+        elif res.stopped_by_block:
+            self.status_var.set("Paused — Google Scholar Access Restriction")
             self.status_val_lbl.configure(fg="#D97706")
-            pct = round(100.0 * res.details_scraped / res.publications_found, 1) if res.publications_found else 0.0
-            self.progress_pct_var.set(pct)
-            self.progress_label_var.set(f"{int(round(pct))}%")
-            block_msg = (
-                f"Google Scholar restricted the publication-detail request ({res.block_reason or res.message}). "
-                f"Scraping stopped safely. All checkpoints and previously scraped CSV records ({res.details_scraped} details, "
-                f"{res.publications_found} publications) are preserved. No blocked endpoint was repeatedly retried."
-            )
-            self.last_notification_text = block_msg
-            self._set_banner(block_msg, kind="warning")
-            self.append_log(f"WARNING: {block_msg}")
+            self.last_notification_text = res.message
+            self._set_banner(res.message, kind="warning")
             if self.show_dialogs:
-                messagebox.showwarning("Google Scholar Rate Limit / CAPTCHA", block_msg, parent=self.root)
-        elif res.status == "ALREADY_COMPLETE":
-            self.status_var.set("Publication Detail Scraping Already Complete")
+                messagebox.showwarning("Google Scholar Access Restriction", res.message, parent=self.root)
+        elif res.status == "ALREADY_STORED":
+            self.status_var.set("Scholar Already Stored")
             self.status_val_lbl.configure(fg="#15803D")
             self.progress_pct_var.set(100.0)
             self.progress_label_var.set("100%")
@@ -1368,21 +1430,12 @@ class ScholarScraperGUI:
             self._set_banner(res.message, kind="success")
             self.append_log(res.message)
             if self.show_dialogs:
-                messagebox.showinfo("Publication Detail Scraping Already Complete", res.message, parent=self.root)
-        elif res.status == "PARTIAL":
-            self.status_var.set("Step 2 Partially Completed")
-            self.status_val_lbl.configure(fg="#D97706")
-            self.last_notification_text = res.message
-            self._set_banner(res.message, kind="warning")
-            self.append_log(res.message)
-            if self.show_dialogs:
-                messagebox.showwarning("Step 2 Partially Completed", res.message, parent=self.root)
+                messagebox.showinfo("Scholar Already Stored", res.message, parent=self.root)
         elif res.exit_code == 0:
             self.status_var.set("Completed Successfully")
             self.status_val_lbl.configure(fg="#15803D")
             self.progress_pct_var.set(100.0)
             self.progress_label_var.set("100%")
-            self.current_pub_var.set("Completed")
             self.last_notification_text = res.message
             self._set_banner(res.message, kind="success")
             self.append_log(f"SUCCESS: {res.message}")
@@ -1395,7 +1448,6 @@ class ScholarScraperGUI:
             self.status_val_lbl.configure(fg="#DC2626")
             self.progress_pct_var.set(0.0)
             self.progress_label_var.set("0%")
-            self.current_pub_var.set("None")
             self.last_notification_text = res.message
             self._set_banner(f"Error: {res.message}", kind="error")
             self.append_log(f"ERROR: {res.message}")
@@ -1412,7 +1464,6 @@ class ScholarScraperGUI:
         self.status_val_lbl.configure(fg="#DC2626")
         self.progress_pct_var.set(0.0)
         self.progress_label_var.set("0%")
-        self.current_pub_var.set("None")
         self.last_notification_text = err_str
         self._set_banner(f"Unexpected error: {err_str}", kind="error")
         self.append_log(f"EXCEPTION: {err_str}")
@@ -1422,6 +1473,11 @@ class ScholarScraperGUI:
     def _on_close(self):
         if self.is_running:
             self.manual_cancel_event.set()
+            self.refresh_cancel_event.set()
+            if self.worker_thread is not None and self.worker_thread.is_alive():
+                self.status_var.set("Finishing current operation before closing...")
+                self.root.after(100, self._on_close)
+                return
         root_logger = logging.getLogger()
         if self.log_handler in root_logger.handlers:
             root_logger.removeHandler(self.log_handler)

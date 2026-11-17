@@ -12,19 +12,21 @@ import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 
-from .browser import canonicalize_detail_url, is_valid_detail_url
 from .erd_schema import CSV_FILES, DETAIL_CSV_FILES, DETAIL_ENTITIES, ERD_ENTITIES
-from .id_registry import IdRegistry, normalize_pub_title
+from .id_registry import IdRegistry
+from .output_paths import OutputPaths
 from .reporting import CsvPermissionError, load_existing_csvs, load_existing_detail_csvs, write_csv
 from .validator import DatasetValidationError, validate_dataset
 
 
 @contextmanager
-def dataset_lock(out_dir: Path):
+def dataset_lock(out_dir: Path, legacy: bool = False):
     """An OS lock, released even after a crash (Windows and POSIX)."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    handle = open(out_dir / ".dataset.lock", "a+b")
+    lock_path = out_dir / ".dataset.lock" if legacy else OutputPaths(out_dir).lock
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(lock_path, "a+b")
     try:
         handle.seek(0)
         handle.write(b"0")
@@ -94,7 +96,8 @@ def _commit_files(out_dir: Path, replacements: dict[str, bytes], validate_after=
             if target.exists():
                 shutil.copy2(target, journal / "backup" / str(index))
             staged = journal / "staged" / str(index)
-            staged.write_bytes(replacements[name])
+            if replacements[name] is not None:
+                staged.write_bytes(replacements[name])
         manifest = journal / "manifest.json"
         manifest.write_text(json.dumps(names), encoding="utf-8")
         with open(manifest, "r+b") as stream:
@@ -103,7 +106,11 @@ def _commit_files(out_dir: Path, replacements: dict[str, bytes], validate_after=
             target = out_dir / name
             target.parent.mkdir(parents=True, exist_ok=True)
             try:
-                os.replace(journal / "staged" / str(index), target)
+                if replacements[name] is None:
+                    if target.exists():
+                        target.unlink()
+                else:
+                    os.replace(journal / "staged" / str(index), target)
             except PermissionError as exc:
                 raise CsvPermissionError(target, operation="replace", original_error=exc) from exc
         if validate_after:
@@ -129,63 +136,18 @@ def scoped_detail_path(out_dir: Path, google_id: str) -> Path:
     safe = "".join(c for c in google_id if c.isalnum() or c in "_-")
     if safe != google_id or not safe:
         raise ValueError("Invalid Google Scholar ID for checkpoint path")
-    return Path(out_dir) / "supplementary" / "checkpoints" / f"{safe}.json"
+    return OutputPaths(out_dir).checkpoints / f"{safe}.json"
 
 
 def all_checkpoints(out_dir: Path) -> list[Path]:
-    root = Path(out_dir) / "supplementary"
-    return sorted((root / "checkpoints").glob("*.json")) + [root / "publication_details_snapshot.json"]
-
-
-def completion_state(out_dir: Path, scholar_id: str, tables=None, detail_tables=None):
-    """SUCCESS requires a matching checkpoint, exported row, URL, title and sync time.
-
-    Optional DOI, journal, issue, publisher and citations are not completion gates.
-    A legacy global checkpoint is read for migration, but never written again.
-    """
-    tables = tables if tables is not None else load_existing_csvs(out_dir)
-    detail_tables = detail_tables if detail_tables is not None else load_existing_detail_csvs(out_dir)
-    linked = {str(r["publication_id"]) for r in tables["Authors Publications"]
-              if str(r["scholar_id"]) == str(scholar_id)}
-    pubs = {str(r["publication_id"]): r for r in tables["PUBLICATIONS"] if str(r["publication_id"]) in linked}
-    details = {str(r["publication_id"]): r for r in detail_tables["PUBLICATION_DETAILS"]}
-    successes = {}
-    statuses = {}
-    for path in all_checkpoints(out_dir):
-        if not path.exists():
-            continue
-        snapshot = json.loads(path.read_text(encoding="utf-8"))
-        for pid, rec in (snapshot.get("publications") or {}).items():
-            if pid in pubs and isinstance(rec, dict):
-                statuses[pid] = rec.get("status", "NOT_ATTEMPTED")
-                if rec.get("status") == "SUCCESS" and isinstance(rec.get("metadata"), dict):
-                    successes.setdefault(pid, []).append(rec)
-    complete = set()
-    for pid, pub in pubs.items():
-        row = details.get(pid)
-        url = canonicalize_detail_url(pub.get("source_url"))
-        detail_url = canonicalize_detail_url(row.get("publication_url")) if row else ""
-        pub_title = normalize_pub_title(pub.get("title"))
-        detail_title = normalize_pub_title(row.get("title")) if row else ""
-        # Shared publications can have a scholar-specific front-page URL for
-        # each author. A prior successful detail URL is still valid for that
-        # same publication_id when both extracted titles agree.
-        alternate_shared_url = (detail_url != url and is_valid_detail_url(detail_url)
-                                and len(pub_title) >= 8
-                                and (pub_title in detail_title or detail_title in pub_title))
-        if (row and (detail_url == url and is_valid_detail_url(detail_url) or alternate_shared_url)
-                and row.get("title", "").strip() and row.get("last_synced_at", "").strip()
-                and any(str(rec.get("publication_id")) == pid
-                        and canonicalize_detail_url(rec.get("publication_url")) == detail_url
-                        and (not alternate_shared_url or normalize_pub_title(rec.get("metadata", {}).get("title")) == detail_title)
-                        for rec in successes.get(pid, []))):
-            complete.add(pid)
-    return {"linked": linked, "complete": complete, "pending": linked - complete,
-            "statuses": statuses, "publications": pubs}
+    paths = OutputPaths(out_dir)
+    return sorted(paths.checkpoints.glob("*.json")) + [paths.checkpoints / "publication_details_snapshot.json"]
 
 
 def preview_deletion(out_dir: Path, google_id: str):
     out_dir = Path(out_dir)
+    from .output_migration import migrate_output
+    migrate_output(out_dir)
     with dataset_lock(out_dir):
         recover_deletion(out_dir)
         tables = load_existing_csvs(out_dir)
@@ -207,6 +169,8 @@ def preview_deletion(out_dir: Path, google_id: str):
 def delete_scholar(out_dir: Path, google_id: str):
     """Delete by Google ID after GUI confirmation; never run on real data in tests."""
     out_dir = Path(out_dir)
+    from .output_migration import migrate_output
+    migrate_output(out_dir)
     with dataset_lock(out_dir):
         recover_deletion(out_dir)
         tables = load_existing_csvs(out_dir)
@@ -219,9 +183,19 @@ def delete_scholar(out_dir: Path, google_id: str):
         errors = validate_dataset(tables, detail_tables=detail)
         if errors:
             raise DatasetValidationError(errors)
-        registry_path = out_dir / "id_registry.json"
+        paths = OutputPaths(out_dir)
+        registry_path = paths.registry
         registry = IdRegistry(registry_path)
         registry.sync_from_tables(tables)
+        from .frontpage_export import export_replacements, image_record, load_images
+        from .browser import ProfileData
+        images = load_images(out_dir)
+        image_ids = {row["scholar_id"] for row in images}
+        for stored_scholar in tables["SCHOLARS"]:
+            if stored_scholar["scholar_id"] not in image_ids:
+                default_image, _ = image_record(out_dir, stored_scholar, ProfileData(requested_url=""),
+                                                images, "")
+                images.append(default_image)
         scholar = matches[0]
         sid = scholar["scholar_id"]
         old_linked = {r["publication_id"] for r in tables["Authors Publications"] if r["scholar_id"] == sid}
@@ -251,15 +225,25 @@ def delete_scholar(out_dir: Path, google_id: str):
         errors = validate_dataset(tables, detail_tables=detail)
         if errors:
             raise DatasetValidationError(errors)
+        removed_images = [row for row in images if row["scholar_id"] == sid]
+        images = [row for row in images if row["scholar_id"] != sid]
         replacements = {}
         registry_bytes = json.dumps({"version": 1, "entities": registry._data},
                                     ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8")
         if not registry_path.exists() or json.loads(registry_path.read_text(encoding="utf-8")) != {"version": 1, "entities": registry._data}:
-            replacements["id_registry.json"] = registry_bytes
-        for entity, name in CSV_FILES.items():
-            replacements[name] = _csv_bytes(ERD_ENTITIES[entity], tables[entity])
+            replacements["system/id_registry.json"] = registry_bytes
+        # Keep both representations synchronized with the canonical CSV rows.
+        replacements.update(export_replacements(tables, images))
+        for image in removed_images:
+            relative = image.get("local_profile_image_path", "")
+            if (relative.startswith("profile_images/") and
+                    (out_dir / relative).resolve().parent == (out_dir / "profile_images").resolve() and
+                    relative not in {row.get("local_profile_image_path") for row in images} and
+                    Path(relative).name == f"{google_id}{Path(relative).suffix}" and
+                    (out_dir / relative).is_file()):
+                replacements[relative] = None
         for entity, name in DETAIL_CSV_FILES.items():
-            replacements[f"supplementary/{name}"] = _csv_bytes(DETAIL_ENTITIES[entity], detail[entity])
+            replacements[f"system/historical/{name}"] = _csv_bytes(DETAIL_ENTITIES[entity], detail[entity])
         # Keep registry entries and next_id counters as historical tombstones.
         target_checkpoint = scoped_detail_path(out_dir, google_id)
         transfers = {}
@@ -290,26 +274,28 @@ def delete_scholar(out_dir: Path, google_id: str):
                 snapshot = {"publications": {}}
             snapshot.setdefault("publications", {}).update(records)
             replacements[relative] = json.dumps(snapshot, ensure_ascii=False, indent=2).encode("utf-8")
-        raw = out_dir / "supplementary" / "raw_profile_snapshot.json"
-        scoped_raw = out_dir / "supplementary" / "profiles" / f"{google_id}.json"
+        raw = paths.snapshots / "raw_profile_snapshot.json"
+        scoped_raw = paths.profile_snapshot(google_id)
         for path in (raw, scoped_raw):
             if path.exists():
                 payload = json.loads(path.read_text(encoding="utf-8"))
                 if payload.get("google_scholar_id") == google_id:
                     replacements[str(path.relative_to(out_dir)).replace("\\", "/")] = b"{}\n"
-        linkage = out_dir / "supplementary" / "record_linkage.csv"
+        linkage = paths.linkage
         if linkage.exists():
             with open(linkage, encoding="utf-8", newline="") as stream:
                 reader = csv.DictReader(stream)
                 cols = reader.fieldnames
                 rows = [r for r in reader if r.get("google_scholar_id") != google_id]
-            replacements["supplementary/record_linkage.csv"] = _csv_bytes(cols, rows)
+            replacements[paths.relative(linkage)] = _csv_bytes(cols, rows)
         def _verify_committed():
             committed_tables = load_existing_csvs(out_dir)
             committed_detail = load_existing_detail_csvs(out_dir)
             issues = validate_dataset(committed_tables, detail_tables=committed_detail)
             if issues:
                 raise DatasetValidationError(issues)
+            if committed_tables != tables or load_images(out_dir) != images:
+                raise ValueError("Deletion commit did not preserve the validated dataset.")
         _commit_files(out_dir, replacements, validate_after=_verify_committed)
         return {"scholar": scholar, "publications_removed": len(removed_pubs),
                 "shared_publications_preserved": len(old_linked - removed_pubs),

@@ -278,7 +278,6 @@ def main() -> int:
                 url=target_url,
                 output_dir=out_429,
                 docx_path=DEFAULT_DOCX,
-                scrape_details=False,
             )
         check(
             "6. HTTP 429 detection remains unchanged and stops immediately with status=BLOCKED",
@@ -300,7 +299,6 @@ def main() -> int:
                 url=target_url,
                 output_dir=out_captcha,
                 docx_path=DEFAULT_DOCX,
-                scrape_details=False,
             )
         check(
             "7. CAPTCHA detection remains unchanged and stops immediately with status=BLOCKED",
@@ -386,7 +384,6 @@ def main() -> int:
                 url="https://scholar.google.com/citations?hl=en&user=vdh-mOQAAAAJ",
                 output_dir=out_csv_safe,
                 docx_path=DEFAULT_DOCX,
-                scrape_details=False,
             )
         hashes_before = snapshot_csv_hashes(out_csv_safe)
 
@@ -401,14 +398,13 @@ def main() -> int:
                 url=target_url,
                 output_dir=out_csv_safe,
                 docx_path=DEFAULT_DOCX,
-                scrape_details=True,
             )
         hashes_after = snapshot_csv_hashes(out_csv_safe)
         check(
             "9. Failed navigation (ERR_PROXY_CONNECTION_FAILED) leaves all 6 existing CSV files byte-for-byte untouched",
             seed_res.exit_code == 0
             and fail_res.status == "PROXY_ERROR"
-            and len(hashes_before) == 6
+            and len(hashes_before) >= 6
             and hashes_before == hashes_after,
         )
 

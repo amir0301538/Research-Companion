@@ -113,7 +113,7 @@ def main() -> int:
         shutil.rmtree(TMP)
     TMP.mkdir(parents=True, exist_ok=True)
 
-    reg_path = TMP / "id_registry.json"
+    reg_path = TMP / "system" / "id_registry.json"
 
     # ----------------------------------------------------------------------- #
     # Initial Run 1 for Scholar A (includes an in-scrape duplicate on row 3)
@@ -272,7 +272,7 @@ def main() -> int:
     # Test 13: Failed validation does not replace the previous valid CSV export
     # ----------------------------------------------------------------------- #
     valid_bytes_snapshot = {
-        fname: (TMP / fname).read_bytes()
+        fname: (TMP / "csv" / fname).read_bytes()
         for fname in [
             "heis.csv",
             "scholars.csv",
@@ -301,7 +301,7 @@ def main() -> int:
         validation_blocked = True
 
     after_failed_bytes = {
-        fname: (TMP / fname).read_bytes() for fname in valid_bytes_snapshot
+        fname: (TMP / "csv" / fname).read_bytes() for fname in valid_bytes_snapshot
     }
     check(
         "13. Failed validation does not replace the previous valid CSV export",

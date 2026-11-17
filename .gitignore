@@ -4,6 +4,7 @@
 
 # Scraper outputs and logs
 output/
+output_migration_backup_*/
 *.log
 
 # Python cache and byte-compiled files
